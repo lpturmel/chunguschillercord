@@ -9,7 +9,13 @@ use std::{fmt, sync::Arc, time::Duration};
 use tokio::time::sleep;
 use tracing::{error, info};
 use twilight_http::Client as DiscordClient;
-use twilight_model::id::{Id, marker::ChannelMarker};
+use twilight_model::{
+    channel::message::AllowedMentions,
+    id::{
+        Id,
+        marker::{ChannelMarker, UserMarker},
+    },
+};
 
 const HENRIKDEV_MMR_URL: &str = "https://api.henrikdev.xyz/valorant/v3/mmr/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -29,14 +35,29 @@ pub(crate) struct ValorantService {
 }
 
 impl ValorantService {
-    pub(crate) async fn current_rank_message(&self) -> WorkerResult<String> {
-        let rank = fetch_rank(&self.client, &self.api_key, &self.player).await?;
-        Ok(format_rank_message(&self.player, &rank))
+    pub(crate) async fn prepare_report(
+        &self,
+        player: &ValorantPlayerConfig,
+        include_mention: bool,
+    ) -> WorkerResult<PreparedReport> {
+        let rank = fetch_rank(&self.client, &self.api_key, player).await?;
+        Ok(PreparedReport {
+            message: format_rank_message(player, &rank, include_mention),
+            allowed_mentions: allowed_mentions_for_player(player, include_mention),
+        })
     }
 
-    pub(crate) fn riot_id(&self) -> &str {
-        &self.player.riot_id
+    pub(crate) fn player_for_discord_user(
+        &self,
+        discord_user_id: Id<UserMarker>,
+    ) -> Option<ValorantPlayerConfig> {
+        (self.player.discord_user_id == Some(discord_user_id)).then(|| self.player.clone())
     }
+}
+
+pub(crate) struct PreparedReport {
+    pub(crate) message: String,
+    pub(crate) allowed_mentions: AllowedMentions,
 }
 
 pub(crate) fn initialize_from_env(
@@ -116,18 +137,16 @@ async fn post_current_rank(
     discord_client: &DiscordClient,
     config: &WorkerConfig,
 ) -> std::result::Result<(), WorkerError> {
-    let rank = fetch_rank(&service.client, &service.api_key, &service.player).await?;
-    let message = format_rank_message(&service.player, &rank);
+    let report = service.prepare_report(&service.player, true).await?;
 
     discord_client
         .create_message(config.discord_channel_id)
-        .content(&message)
+        .content(&report.message)
+        .allowed_mentions(Some(&report.allowed_mentions))
         .await?;
 
     info!(
         riot_id = %service.player.riot_id,
-        tier = %rank.tier.name,
-        rr = rank.rr,
         "Posted Valorant rank to Discord"
     );
     Ok(())
@@ -166,17 +185,41 @@ async fn fetch_rank(
     Ok(response.data.current)
 }
 
-fn format_rank_message(player: &ValorantPlayerConfig, rank: &CurrentRank) -> String {
+fn format_rank_message(
+    player: &ValorantPlayerConfig,
+    rank: &CurrentRank,
+    include_mention: bool,
+) -> String {
     let last_change = match rank.last_change {
         Some(change) if change > 0 => format!(" (+{change} RR last game)"),
         Some(change) if change < 0 => format!(" ({change} RR last game)"),
         _ => String::new(),
     };
 
+    let mention = include_mention
+        .then_some(player.discord_user_id)
+        .flatten()
+        .map(|user_id| format!("\n<@{}>", user_id.get()))
+        .unwrap_or_default();
+
     format!(
-        "**{}** is currently **{} — {} RR**{last_change}.",
+        "**{}** is currently **{} — {} RR**{last_change}.{mention}",
         player.riot_id, rank.tier.name, rank.rr
     )
+}
+
+fn allowed_mentions_for_player(
+    player: &ValorantPlayerConfig,
+    include_mention: bool,
+) -> AllowedMentions {
+    AllowedMentions {
+        users: if include_mention {
+            player.discord_user_id.iter().copied().collect()
+        } else {
+            Vec::new()
+        },
+        ..AllowedMentions::default()
+    }
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -273,6 +316,7 @@ mod tests {
             tag_line: "0031".to_string(),
             region: "na".to_string(),
             platform: "pc".to_string(),
+            discord_user_id: Some(Id::new(123_456_789)),
         };
         let positive = CurrentRank {
             tier: Tier {
@@ -290,13 +334,40 @@ mod tests {
         };
 
         assert_eq!(
-            format_rank_message(&player, &positive),
+            format_rank_message(&player, &positive, false),
             "**xRayzor#0031** is currently **Gold 2 — 63 RR** (+18 RR last game)."
         );
         assert_eq!(
-            format_rank_message(&player, &negative),
+            format_rank_message(&player, &negative, false),
             "**xRayzor#0031** is currently **Gold 2 — 44 RR** (-19 RR last game)."
         );
+    }
+
+    #[test]
+    fn scheduled_report_mentions_only_the_configured_user() {
+        let player = ValorantPlayerConfig {
+            riot_id: "xRayzor#0031".to_string(),
+            game_name: "xRayzor".to_string(),
+            tag_line: "0031".to_string(),
+            region: "na".to_string(),
+            platform: "pc".to_string(),
+            discord_user_id: Some(Id::new(123_456_789)),
+        };
+        let rank = CurrentRank {
+            tier: Tier {
+                name: "Gold 2".to_string(),
+            },
+            rr: 63,
+            last_change: Some(18),
+        };
+
+        let message = format_rank_message(&player, &rank, true);
+        let allowed_mentions = allowed_mentions_for_player(&player, true);
+
+        assert!(message.ends_with("\n<@123456789>"));
+        assert_eq!(allowed_mentions.users, vec![Id::new(123_456_789)]);
+        assert!(allowed_mentions.roles.is_empty());
+        assert!(allowed_mentions.parse.is_empty());
     }
 
     #[test]

@@ -292,6 +292,12 @@ fn handle_valorant(
     let Some(service) = state.valorant.as_ref() else {
         return discord_message("The Valorant rank worker is currently disabled.", true);
     };
+    let Some(player) = service.player_for_discord_user(discord_user_id) else {
+        return discord_message(
+            "Your Discord account is not linked to a Valorant Riot ID in `config/league-valorant-rank.ron`.",
+            true,
+        );
+    };
     if let Some(remaining) = claim_manual_poll(&state.cooldowns, Command::Valorant, discord_user_id)
     {
         return cooldown_message(Command::Valorant, remaining);
@@ -304,24 +310,28 @@ fn handle_valorant(
     let discord_client = Arc::clone(&state.discord_client);
     let application_id = state.application_id;
     tokio::spawn(async move {
-        let content = match service.current_rank_message().await {
-            Ok(message) => {
-                info!(riot_id = %service.riot_id(), "Prepared manual Valorant rank report");
-                message
+        let (content, allowed_mentions) = match service.prepare_report(&player, false).await {
+            Ok(report) => {
+                info!(riot_id = %player.riot_id, "Prepared manual Valorant rank report");
+                (report.message, report.allowed_mentions)
             }
             Err(err) => {
-                error!(riot_id = %service.riot_id(), "Manual Valorant rank report failed: {err}");
-                "I couldn't load the Valorant rank right now. Please try again shortly.".to_string()
+                error!(riot_id = %player.riot_id, "Manual Valorant rank report failed: {err}");
+                (
+                    "I couldn't load your Valorant rank right now. Please try again shortly."
+                        .to_string(),
+                    AllowedMentions::default(),
+                )
             }
         };
         if let Err(err) = discord_client
             .interaction(application_id)
             .update_response(&token)
             .content(Some(&content))
-            .allowed_mentions(Some(&AllowedMentions::default()))
+            .allowed_mentions(Some(&allowed_mentions))
             .await
         {
-            error!(riot_id = %service.riot_id(), "Failed to finish /valorant response: {err}");
+            error!(riot_id = %player.riot_id, "Failed to finish /valorant response: {err}");
         }
     });
     discord_response(DEFERRED_MESSAGE_RESPONSE, None)

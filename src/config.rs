@@ -72,6 +72,7 @@ pub(crate) struct ValorantPlayerConfig {
     pub(crate) tag_line: String,
     pub(crate) region: String,
     pub(crate) platform: String,
+    pub(crate) discord_user_id: Option<Id<UserMarker>>,
 }
 
 pub(crate) struct GameConfig {
@@ -111,6 +112,8 @@ struct FileValorantConfig {
     riot_id: String,
     region: String,
     platform: String,
+    #[serde(default)]
+    discord_user_id: Option<u64>,
 }
 
 pub(crate) fn load() -> Result<GameConfig> {
@@ -249,12 +252,22 @@ fn validate_valorant_player(raw: FileValorantConfig) -> Result<ValorantPlayerCon
             raw.platform
         )));
     }
+    let discord_user_id = match raw.discord_user_id {
+        Some(value) => Some(Id::new_checked(value).ok_or_else(|| {
+            Error::Config(format!(
+                "Discord user ID for {} must be greater than zero",
+                raw.riot_id
+            ))
+        })?),
+        None => None,
+    };
     Ok(ValorantPlayerConfig {
         riot_id: format!("{game_name}#{tag_line}"),
         game_name,
         tag_line,
         region,
         platform,
+        discord_user_id,
     })
 }
 
@@ -340,6 +353,7 @@ mod tests {
                 riot_id: "xRayzor#0031",
                 region: "NA",
                 platform: "PC",
+                discord_user_id: Some(123456789),
             ),
         )"#;
         let config = validate(ron::from_str(source).unwrap()).unwrap();
@@ -348,6 +362,10 @@ mod tests {
         assert_eq!(config.league_players[0].riot_id, "liights#6957");
         assert_eq!(config.valorant_player.riot_id, "xRayzor#0031");
         assert_eq!(config.valorant_player.region, "na");
+        assert_eq!(
+            config.valorant_player.discord_user_id,
+            Some(Id::new(123456789))
+        );
     }
 
     #[test]
