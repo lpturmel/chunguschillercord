@@ -1,24 +1,12 @@
-use crate::error::{Error, Result};
-use axum::{
-    Router,
-    body::Bytes,
-    extract::State,
-    http::{HeaderMap, StatusCode as HttpStatusCode},
-    response::{IntoResponse, Response},
-    routing::post,
+use crate::{
+    config::{LeaguePlayerConfig as PlayerConfig, Schedule},
+    error::{Error, Result},
 };
-use chrono::{DateTime, Days, LocalResult, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use ed25519_dalek::{Signature, VerifyingKey};
 use reqwest::{Client as HttpClient, StatusCode, Url, header::RETRY_AFTER};
 use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::json;
-use std::{
-    collections::{HashMap, HashSet},
-    fmt, fs,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{fmt, fs, sync::Arc, time::Duration};
 use tokio::{sync::Mutex as AsyncMutex, time::sleep};
 use tracing::{error, info, warn};
 use twilight_http::Client as DiscordClient;
@@ -26,11 +14,10 @@ use twilight_model::{
     channel::message::AllowedMentions,
     id::{
         Id,
-        marker::{ApplicationMarker, ChannelMarker, GuildMarker, UserMarker},
+        marker::{ChannelMarker, UserMarker},
     },
 };
 
-const DEFAULT_CONFIG_PATH: &str = "config/league-rank.ron";
 const DEFAULT_DATABASE_PATH: &str = "/tmp/chunguschillercord.db";
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -48,56 +35,18 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MATCH_REQUEST_PAUSE: Duration = Duration::from_millis(75);
 const RANKED_SOLO_QUEUE_ID: u16 = 420;
 const RANKED_SOLO_QUEUE_TYPE: &str = "RANKED_SOLO_5x5";
-const MANUAL_POLL_COOLDOWN: Duration = Duration::from_secs(60);
-const DISCORD_SIGNATURE_MAX_AGE: Duration = Duration::from_secs(5 * 60);
-const DISCORD_EPHEMERAL_FLAG: u64 = 1 << 6;
-const DISCORD_PING: u8 = 1;
-const DISCORD_APPLICATION_COMMAND: u8 = 2;
-const DISCORD_PONG_RESPONSE: u8 = 1;
-const DISCORD_MESSAGE_RESPONSE: u8 = 4;
-const DISCORD_DEFERRED_MESSAGE_RESPONSE: u8 = 5;
-
 #[derive(Clone)]
 struct Config {
     riot_api_key: String,
     discord_bot_token: String,
     discord_channel_id: Id<ChannelMarker>,
-    time_zone: Tz,
-    post_times: Vec<NaiveTime>,
+    schedule: Schedule,
     users: Vec<PlayerConfig>,
     post_on_startup: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PlayerConfig {
-    riot_id: String,
-    game_name: String,
-    tag_line: String,
-    platform: String,
-    regional_route: String,
-    discord_user_id: Option<Id<UserMarker>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileConfig {
-    timezone: String,
-    post_times: Vec<String>,
-    users: Vec<FilePlayerConfig>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilePlayerConfig {
-    riot_id: String,
-    platform: String,
-    regional_route: String,
-    #[serde(default)]
-    discord_user_id: Option<u64>,
-}
-
 impl Config {
-    fn from_env() -> Result<Option<Self>> {
+    fn from_env(schedule: Schedule, users: Vec<PlayerConfig>) -> Result<Option<Self>> {
         let Some(riot_api_key) = env_value("RIOT_API_KEY") else {
             info!("League rank bot is disabled; RIOT_API_KEY is not set");
             return Ok(None);
@@ -105,34 +54,23 @@ impl Config {
 
         let discord_bot_token = require_env("DISCORD_BOT_TOKEN")?;
         let discord_channel_id = parse_channel_id(&require_env("DISCORD_CHANNEL_ID")?)?;
-        let config_path = env_value("LEAGUE_RANK_CONFIG").unwrap_or_else(default_config_path);
-        let source = fs::read_to_string(&config_path).map_err(|err| {
-            Error::Config(format!(
-                "Failed to read League rank config {config_path}: {err}"
-            ))
-        })?;
-        let file_config = ron::from_str::<FileConfig>(&source).map_err(|err| {
-            Error::Config(format!(
-                "Failed to parse League rank config {config_path}: {err}"
-            ))
-        })?;
-        let (time_zone, post_times, users) = validate_file_config(file_config)?;
-
         Ok(Some(Self {
             riot_api_key,
             discord_bot_token,
             discord_channel_id,
-            time_zone,
-            post_times,
+            schedule,
             users,
             post_on_startup: env_flag("LEAGUE_RANK_POST_ON_STARTUP"),
         }))
     }
 }
 
-pub async fn initialize_from_env() -> Result<Router> {
-    let Some(config) = Config::from_env()? else {
-        return Ok(Router::new());
+pub(crate) async fn initialize_from_env(
+    schedule: Schedule,
+    users: Vec<PlayerConfig>,
+) -> Result<Option<Arc<LeagueService>>> {
+    let Some(config) = Config::from_env(schedule, users)? else {
+        return Ok(None);
     };
     let store = RankStore::from_env().await?;
     let riot_client = RiotClient::new(config.riot_api_key.clone())
@@ -140,39 +78,18 @@ pub async fn initialize_from_env() -> Result<Router> {
     let service = Arc::new(LeagueService {
         riot_client,
         store,
-        time_zone: config.time_zone,
+        time_zone: config.schedule.time_zone,
         users: Arc::from(config.users.clone()),
     });
-    let interaction_config = InteractionConfig::from_env()?;
-    let interaction_router = if let Some(interaction_config) = interaction_config {
-        register_league_command(&config.discord_bot_token, &interaction_config).await?;
-        let state = Arc::new(InteractionState {
-            service: Arc::clone(&service),
-            discord_client: Arc::new(DiscordClient::new(config.discord_bot_token.clone())),
-            application_id: interaction_config.application_id,
-            public_key: interaction_config.public_key,
-            cooldowns: Mutex::new(HashMap::new()),
-        });
-
-        info!("Discord /league interaction endpoint is enabled");
-        Router::new()
-            .route("/discord/interactions", post(handle_discord_interaction))
-            .with_state(state)
-    } else {
-        info!(
-            "Discord /league command is disabled; DISCORD_APPLICATION_ID and DISCORD_PUBLIC_KEY are not set"
-        );
-        Router::new()
-    };
 
     info!(
         users = config.users.len(),
-        time_zone = %config.time_zone,
-        post_times = %format_post_times(&config.post_times),
+        time_zone = %config.schedule.time_zone,
+        post_times = %config.schedule.formatted_post_times(),
         "Starting League rank bot"
     );
-    tokio::spawn(run(config, service));
-    Ok(interaction_router)
+    tokio::spawn(run(config, Arc::clone(&service)));
+    Ok(Some(service))
 }
 
 async fn run(config: Config, service: Arc<LeagueService>) {
@@ -185,13 +102,13 @@ async fn run(config: Config, service: Arc<LeagueService>) {
 
     loop {
         let now = Utc::now();
-        let next_post = next_post_after(now, config.time_zone, &config.post_times);
+        let next_post = config.schedule.next_post_after(now);
         let wait = (next_post - now)
             .to_std()
             .unwrap_or_else(|_| Duration::from_secs(0));
 
         info!(
-            next_post = %next_post.with_timezone(&config.time_zone),
+            next_post = %next_post.with_timezone(&config.schedule.time_zone),
             "League rank recap scheduled"
         );
         sleep(wait).await;
@@ -238,22 +155,22 @@ async fn post_player_report(
 }
 
 #[derive(Clone)]
-struct LeagueService {
+pub(crate) struct LeagueService {
     riot_client: RiotClient,
     store: RankStore,
     time_zone: Tz,
     users: Arc<[PlayerConfig]>,
 }
 
-struct PreparedReport {
-    message: String,
-    allowed_mentions: AllowedMentions,
+pub(crate) struct PreparedReport {
+    pub(crate) message: String,
+    pub(crate) allowed_mentions: AllowedMentions,
     current: RankSnapshot,
     record: MatchRecord,
 }
 
 impl LeagueService {
-    async fn prepare_report(
+    pub(crate) async fn prepare_report(
         &self,
         player: &PlayerConfig,
         include_mention: bool,
@@ -296,339 +213,15 @@ impl LeagueService {
         })
     }
 
-    fn player_for_discord_user(&self, discord_user_id: Id<UserMarker>) -> Option<PlayerConfig> {
+    pub(crate) fn player_for_discord_user(
+        &self,
+        discord_user_id: Id<UserMarker>,
+    ) -> Option<PlayerConfig> {
         self.users
             .iter()
             .find(|player| player.discord_user_id == Some(discord_user_id))
             .cloned()
     }
-}
-
-struct InteractionConfig {
-    application_id: Id<ApplicationMarker>,
-    public_key: VerifyingKey,
-    guild_id: Option<Id<GuildMarker>>,
-}
-
-impl InteractionConfig {
-    fn from_env() -> Result<Option<Self>> {
-        let application_id = env_value("DISCORD_APPLICATION_ID");
-        let public_key = env_value("DISCORD_PUBLIC_KEY");
-        let guild_id = env_value("DISCORD_GUILD_ID");
-
-        if application_id.is_none() && public_key.is_none() && guild_id.is_none() {
-            return Ok(None);
-        }
-
-        let application_id = parse_application_id(
-            application_id
-                .as_deref()
-                .ok_or_else(|| Error::Config("Missing env var DISCORD_APPLICATION_ID".into()))?,
-        )?;
-        let public_key = parse_discord_public_key(
-            public_key
-                .as_deref()
-                .ok_or_else(|| Error::Config("Missing env var DISCORD_PUBLIC_KEY".into()))?,
-        )?;
-        let guild_id = guild_id.as_deref().map(parse_guild_id).transpose()?;
-
-        Ok(Some(Self {
-            application_id,
-            public_key,
-            guild_id,
-        }))
-    }
-}
-
-struct InteractionState {
-    service: Arc<LeagueService>,
-    discord_client: Arc<DiscordClient>,
-    application_id: Id<ApplicationMarker>,
-    public_key: VerifyingKey,
-    cooldowns: Mutex<HashMap<Id<UserMarker>, Instant>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscordInteraction {
-    #[serde(rename = "type")]
-    kind: u8,
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(default)]
-    data: Option<DiscordInteractionData>,
-    #[serde(default)]
-    member: Option<DiscordMember>,
-    #[serde(default)]
-    user: Option<DiscordUser>,
-}
-
-impl DiscordInteraction {
-    fn author_id(&self) -> Option<Id<UserMarker>> {
-        self.member
-            .as_ref()
-            .map(|member| &member.user)
-            .or(self.user.as_ref())
-            .and_then(|user| user.id.parse::<u64>().ok())
-            .and_then(Id::new_checked)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscordInteractionData {
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscordMember {
-    user: DiscordUser,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiscordUser {
-    id: String,
-}
-
-async fn handle_discord_interaction(
-    State(state): State<Arc<InteractionState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let Some(signature) = header_text(&headers, "X-Signature-Ed25519") else {
-        return (HttpStatusCode::UNAUTHORIZED, "missing Discord signature").into_response();
-    };
-    let Some(timestamp) = header_text(&headers, "X-Signature-Timestamp") else {
-        return (HttpStatusCode::UNAUTHORIZED, "missing Discord timestamp").into_response();
-    };
-    if !verify_discord_request(&state.public_key, signature, timestamp, &body) {
-        return (HttpStatusCode::UNAUTHORIZED, "invalid Discord signature").into_response();
-    }
-
-    let interaction = match serde_json::from_slice::<DiscordInteraction>(&body) {
-        Ok(interaction) => interaction,
-        Err(err) => {
-            warn!("Discord interaction JSON was invalid: {err}");
-            return (HttpStatusCode::BAD_REQUEST, "invalid Discord interaction").into_response();
-        }
-    };
-
-    if interaction.kind == DISCORD_PING {
-        return discord_response(DISCORD_PONG_RESPONSE, None);
-    }
-    if interaction.kind != DISCORD_APPLICATION_COMMAND
-        || interaction.data.as_ref().map(|data| data.name.as_str()) != Some("league")
-    {
-        return discord_message("This endpoint only handles the `/league` command.", true);
-    }
-
-    let Some(discord_user_id) = interaction.author_id() else {
-        return discord_message("Discord did not include the invoking user.", true);
-    };
-    let Some(player) = state.service.player_for_discord_user(discord_user_id) else {
-        return discord_message(
-            "Your Discord account is not linked to a Riot ID. Add your Discord user ID to `config/league-rank.ron` and restart the app.",
-            true,
-        );
-    };
-    if let Some(remaining) = claim_manual_poll(&state.cooldowns, discord_user_id) {
-        return discord_message(
-            &format!("Please wait {remaining} seconds before using `/league` again."),
-            true,
-        );
-    }
-    let Some(token) = interaction.token else {
-        return discord_message("Discord did not include an interaction token.", true);
-    };
-
-    let service = Arc::clone(&state.service);
-    let discord_client = state.discord_client.clone();
-    let application_id = state.application_id;
-    tokio::spawn(async move {
-        let result = service.prepare_report(&player, false).await;
-        let (content, allowed_mentions) = match result {
-            Ok(report) => {
-                info!(
-                    riot_id = %player.riot_id,
-                    "Prepared manual League rank recap without changing the scheduled snapshot"
-                );
-                (report.message, report.allowed_mentions)
-            }
-            Err(err) => {
-                error!(riot_id = %player.riot_id, "Manual League rank recap failed: {err}");
-                (
-                    "I couldn't load your League recap right now. Please try again shortly."
-                        .to_string(),
-                    AllowedMentions::default(),
-                )
-            }
-        };
-
-        if let Err(err) = discord_client
-            .interaction(application_id)
-            .update_response(&token)
-            .content(Some(&content))
-            .allowed_mentions(Some(&allowed_mentions))
-            .await
-        {
-            error!(riot_id = %player.riot_id, "Failed to finish /league response: {err}");
-        }
-    });
-
-    discord_response(DISCORD_DEFERRED_MESSAGE_RESPONSE, None)
-}
-
-fn claim_manual_poll(
-    cooldowns: &Mutex<HashMap<Id<UserMarker>, Instant>>,
-    user_id: Id<UserMarker>,
-) -> Option<u64> {
-    let mut cooldowns = cooldowns.lock().unwrap_or_else(|err| err.into_inner());
-    let now = Instant::now();
-    if let Some(last_poll) = cooldowns.get(&user_id) {
-        let elapsed = now.saturating_duration_since(*last_poll);
-        if elapsed < MANUAL_POLL_COOLDOWN {
-            return Some((MANUAL_POLL_COOLDOWN - elapsed).as_secs().max(1));
-        }
-    }
-    cooldowns.insert(user_id, now);
-    None
-}
-
-fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name)?.to_str().ok()
-}
-
-fn verify_discord_request(
-    public_key: &VerifyingKey,
-    signature_hex: &str,
-    timestamp: &str,
-    body: &[u8],
-) -> bool {
-    let Ok(timestamp_seconds) = timestamp.parse::<u64>() else {
-        return false;
-    };
-    let Ok(now_seconds) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return false;
-    };
-    if now_seconds.abs_diff(Duration::from_secs(timestamp_seconds)) > DISCORD_SIGNATURE_MAX_AGE {
-        return false;
-    }
-    let Ok(signature_bytes) = hex::decode(signature_hex) else {
-        return false;
-    };
-    let Ok(signature) = Signature::from_slice(&signature_bytes) else {
-        return false;
-    };
-    let mut message = Vec::with_capacity(timestamp.len() + body.len());
-    message.extend_from_slice(timestamp.as_bytes());
-    message.extend_from_slice(body);
-
-    public_key.verify_strict(&message, &signature).is_ok()
-}
-
-fn discord_message(content: &str, ephemeral: bool) -> Response {
-    let mut data = json!({
-        "content": content,
-        "allowed_mentions": { "parse": [] },
-    });
-    if ephemeral {
-        data["flags"] = json!(DISCORD_EPHEMERAL_FLAG);
-    }
-    discord_response(DISCORD_MESSAGE_RESPONSE, Some(data))
-}
-
-fn discord_response(kind: u8, data: Option<serde_json::Value>) -> Response {
-    let payload = match data {
-        Some(data) => json!({ "type": kind, "data": data }),
-        None => json!({ "type": kind }),
-    };
-    axum::Json(payload).into_response()
-}
-
-async fn register_league_command(bot_token: &str, config: &InteractionConfig) -> Result<()> {
-    let (url, command) = command_registration(config);
-    let response = HttpClient::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent("chunguschillercord/0.1 Discord command registration")
-        .build()?
-        .post(url)
-        .header("Authorization", format!("Bot {bot_token}"))
-        .json(&command)
-        .send()
-        .await?;
-    let status = response.status();
-    if !status.is_success() {
-        let detail = response.text().await.unwrap_or_default();
-        return Err(Error::Config(format!(
-            "Discord failed to register /league ({status}): {}",
-            detail.chars().take(500).collect::<String>()
-        )));
-    }
-
-    info!(
-        scope = if config.guild_id.is_some() {
-            "guild"
-        } else {
-            "global"
-        },
-        "Registered Discord /league command"
-    );
-    Ok(())
-}
-
-fn command_registration(config: &InteractionConfig) -> (String, serde_json::Value) {
-    match config.guild_id {
-        Some(guild_id) => (
-            format!(
-                "https://discord.com/api/v10/applications/{}/guilds/{}/commands",
-                config.application_id.get(),
-                guild_id.get()
-            ),
-            json!({
-                "name": "league",
-                "description": "Show your League ranked recap",
-                "type": 1,
-            }),
-        ),
-        None => (
-            format!(
-                "https://discord.com/api/v10/applications/{}/commands",
-                config.application_id.get()
-            ),
-            json!({
-                "name": "league",
-                "description": "Show your League ranked recap",
-                "type": 1,
-                "contexts": [0],
-                "integration_types": [0],
-            }),
-        ),
-    }
-}
-
-fn parse_application_id(value: &str) -> Result<Id<ApplicationMarker>> {
-    let value = value.parse::<u64>().map_err(|_| {
-        Error::Config("DISCORD_APPLICATION_ID must be a positive integer".to_string())
-    })?;
-    Id::new_checked(value).ok_or_else(|| {
-        Error::Config("DISCORD_APPLICATION_ID must be greater than zero".to_string())
-    })
-}
-
-fn parse_guild_id(value: &str) -> Result<Id<GuildMarker>> {
-    let value = value
-        .parse::<u64>()
-        .map_err(|_| Error::Config("DISCORD_GUILD_ID must be a positive integer".to_string()))?;
-    Id::new_checked(value)
-        .ok_or_else(|| Error::Config("DISCORD_GUILD_ID must be greater than zero".to_string()))
-}
-
-fn parse_discord_public_key(value: &str) -> Result<VerifyingKey> {
-    let bytes = hex::decode(value)
-        .map_err(|_| Error::Config("DISCORD_PUBLIC_KEY must be hexadecimal".to_string()))?;
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-        Error::Config("DISCORD_PUBLIC_KEY must decode to exactly 32 bytes".to_string())
-    })?;
-    VerifyingKey::from_bytes(&bytes)
-        .map_err(|_| Error::Config("DISCORD_PUBLIC_KEY is not a valid Ed25519 key".to_string()))
 }
 
 #[derive(Clone)]
@@ -1164,168 +757,6 @@ fn escape_discord_markdown(value: &str) -> String {
         .replace('>', "\\>")
 }
 
-fn next_post_after(now: DateTime<Utc>, time_zone: Tz, post_times: &[NaiveTime]) -> DateTime<Utc> {
-    let local_now = now.with_timezone(&time_zone);
-
-    for day_offset in 0..=2 {
-        let date = local_now
-            .date_naive()
-            .checked_add_days(Days::new(day_offset))
-            .expect("next League rank post date is representable");
-
-        for post_time in post_times {
-            let local_time = date.and_time(*post_time);
-            let candidate = match time_zone.from_local_datetime(&local_time) {
-                LocalResult::Single(candidate) => candidate,
-                LocalResult::Ambiguous(earlier, later) => {
-                    if earlier > local_now {
-                        earlier
-                    } else {
-                        later
-                    }
-                }
-                LocalResult::None => continue,
-            };
-
-            if candidate > local_now {
-                return candidate.with_timezone(&Utc);
-            }
-        }
-    }
-
-    unreachable!("a scheduled League rank post exists within the next two days")
-}
-
-fn validate_file_config(file: FileConfig) -> Result<(Tz, Vec<NaiveTime>, Vec<PlayerConfig>)> {
-    let time_zone = file.timezone.parse::<Tz>().map_err(|_| {
-        Error::Config(format!(
-            "League rank timezone must be an IANA time zone; got {}",
-            file.timezone
-        ))
-    })?;
-    let mut post_times = file
-        .post_times
-        .iter()
-        .map(|value| {
-            NaiveTime::parse_from_str(value, "%H:%M").map_err(|_| {
-                Error::Config(format!(
-                    "League rank post time must use 24-hour HH:MM format; got {value}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    post_times.sort_unstable();
-    post_times.dedup();
-    if post_times.is_empty() {
-        return Err(Error::Config(
-            "League rank config must contain at least one post time".to_string(),
-        ));
-    }
-    if file.users.is_empty() {
-        return Err(Error::Config(
-            "League rank config must contain at least one user".to_string(),
-        ));
-    }
-
-    let mut seen = HashSet::new();
-    let mut seen_discord_users = HashSet::new();
-    let mut users = Vec::with_capacity(file.users.len());
-    for raw in file.users {
-        let (game_name, tag_line) = parse_riot_id(&raw.riot_id)?;
-        let platform = raw.platform.trim().to_ascii_lowercase();
-        if !is_platform_route(&platform) {
-            return Err(Error::Config(format!(
-                "Unsupported League platform route {} for {}",
-                raw.platform, raw.riot_id
-            )));
-        }
-        let regional_route = raw.regional_route.trim().to_ascii_lowercase();
-        if !matches!(
-            regional_route.as_str(),
-            "americas" | "asia" | "europe" | "sea"
-        ) {
-            return Err(Error::Config(format!(
-                "Unsupported Riot regional route {} for {}",
-                raw.regional_route, raw.riot_id
-            )));
-        }
-        let riot_id = format!("{game_name}#{tag_line}");
-        let identity_key = format!("{platform}:{}", riot_id.to_lowercase());
-        if !seen.insert(identity_key) {
-            return Err(Error::Config(format!(
-                "Duplicate League rank user {riot_id} on {platform}"
-            )));
-        }
-        let discord_user_id = match raw.discord_user_id {
-            Some(value) => Some(Id::new_checked(value).ok_or_else(|| {
-                Error::Config(format!(
-                    "Discord user ID for {riot_id} must be greater than zero"
-                ))
-            })?),
-            None => None,
-        };
-        if let Some(discord_user_id) = discord_user_id
-            && !seen_discord_users.insert(discord_user_id)
-        {
-            return Err(Error::Config(format!(
-                "Discord user ID {} is linked to more than one League user",
-                discord_user_id.get()
-            )));
-        }
-
-        users.push(PlayerConfig {
-            riot_id,
-            game_name,
-            tag_line,
-            platform,
-            regional_route,
-            discord_user_id,
-        });
-    }
-
-    Ok((time_zone, post_times, users))
-}
-
-fn parse_riot_id(value: &str) -> Result<(String, String)> {
-    let value = value.trim();
-    let Some((game_name, tag_line)) = value.rsplit_once('#') else {
-        return Err(Error::Config(format!(
-            "League Riot ID must use GameName#TagLine format; got {value}"
-        )));
-    };
-    let game_name = game_name.trim();
-    let tag_line = tag_line.trim();
-    if game_name.is_empty() || tag_line.is_empty() {
-        return Err(Error::Config(format!(
-            "League Riot ID must include both a game name and tag line; got {value}"
-        )));
-    }
-    Ok((game_name.to_string(), tag_line.to_string()))
-}
-
-fn is_platform_route(value: &str) -> bool {
-    matches!(
-        value,
-        "br1"
-            | "eun1"
-            | "euw1"
-            | "jp1"
-            | "kr"
-            | "la1"
-            | "la2"
-            | "me1"
-            | "na1"
-            | "oc1"
-            | "ph2"
-            | "ru"
-            | "sg2"
-            | "th2"
-            | "tr1"
-            | "tw2"
-            | "vn2"
-    )
-}
-
 fn riot_url(route: &str, path_segments: &[&str]) -> Url {
     let mut url = Url::parse(&format!("https://{route}.api.riotgames.com/"))
         .expect("validated Riot route produces a valid URL");
@@ -1336,31 +767,12 @@ fn riot_url(route: &str, path_segments: &[&str]) -> Url {
     url
 }
 
-fn format_post_times(post_times: &[NaiveTime]) -> String {
-    post_times
-        .iter()
-        .map(|time| time.format("%H:%M").to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn parse_channel_id(value: &str) -> Result<Id<ChannelMarker>> {
     let value = value
         .parse::<u64>()
         .map_err(|_| Error::Config("DISCORD_CHANNEL_ID must be a positive integer".to_string()))?;
     Id::new_checked(value)
         .ok_or_else(|| Error::Config("DISCORD_CHANNEL_ID must be greater than zero".to_string()))
-}
-
-fn default_config_path() -> String {
-    let runtime_path = std::path::Path::new(DEFAULT_CONFIG_PATH);
-    if runtime_path.exists() {
-        return runtime_path.display().to_string();
-    }
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(DEFAULT_CONFIG_PATH)
-        .display()
-        .to_string()
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -1409,10 +821,10 @@ struct ParticipantDto {
     win: bool,
 }
 
-type WorkerResult<T> = std::result::Result<T, WorkerError>;
+pub(crate) type WorkerResult<T> = std::result::Result<T, WorkerError>;
 
 #[derive(Debug)]
-enum WorkerError {
+pub(crate) enum WorkerError {
     Request(reqwest::Error),
     RiotApi { status: StatusCode, detail: String },
     Discord(twilight_http::Error),
@@ -1463,7 +875,7 @@ impl From<chrono::ParseError> for WorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
+    use chrono::TimeZone;
 
     fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
@@ -1488,78 +900,6 @@ mod tests {
             division: division.map(str::to_string),
             league_points,
         }
-    }
-
-    #[test]
-    fn parses_and_validates_ron_config() {
-        let source = r#"(
-            timezone: "America/Toronto",
-            post_times: ["23:00", "09:00"],
-            users: [(
-                riot_id: "liights#6957",
-                platform: "NA1",
-                regional_route: "americas",
-            )],
-        )"#;
-        let file: FileConfig = ron::from_str(source).unwrap();
-        let (time_zone, times, users) = validate_file_config(file).unwrap();
-
-        assert_eq!(time_zone, chrono_tz::America::Toronto);
-        assert_eq!(format_post_times(&times), "09:00, 23:00");
-        assert_eq!(users, vec![player()]);
-    }
-
-    #[test]
-    fn rejects_malformed_riot_ids() {
-        assert!(parse_riot_id("liights6957").is_err());
-        assert!(parse_riot_id("#6957").is_err());
-        assert!(parse_riot_id("liights#").is_err());
-    }
-
-    #[test]
-    fn rejects_a_discord_user_linked_to_multiple_riot_ids() {
-        let source = r#"(
-            timezone: "America/Toronto",
-            post_times: ["09:00"],
-            users: [
-                (
-                    riot_id: "liights#6957",
-                    platform: "na1",
-                    regional_route: "americas",
-                    discord_user_id: Some(123456789),
-                ),
-                (
-                    riot_id: "rems#6666",
-                    platform: "na1",
-                    regional_route: "americas",
-                    discord_user_id: Some(123456789),
-                ),
-            ],
-        )"#;
-        let file: FileConfig = ron::from_str(source).unwrap();
-
-        assert!(validate_file_config(file).is_err());
-    }
-
-    #[test]
-    fn schedules_configured_times_with_daylight_saving() {
-        let times = vec![
-            NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
-            NaiveTime::from_hms_opt(23, 0, 0).unwrap(),
-        ];
-
-        assert_eq!(
-            next_post_after(utc(2026, 8, 9, 12, 59), chrono_tz::America::Toronto, &times),
-            utc(2026, 8, 9, 13, 0)
-        );
-        assert_eq!(
-            next_post_after(
-                utc(2026, 12, 9, 13, 59),
-                chrono_tz::America::Toronto,
-                &times
-            ),
-            utc(2026, 12, 9, 14, 0)
-        );
     }
 
     #[test]
@@ -1663,63 +1003,6 @@ mod tests {
     }
 
     #[test]
-    fn verifies_discord_signatures_over_timestamp_and_raw_body() {
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            .to_string();
-        let body = br#"{"type":1}"#;
-        let mut message = timestamp.as_bytes().to_vec();
-        message.extend_from_slice(body);
-        let signature = signing_key.sign(&message);
-        let signature_hex = hex::encode(signature.to_bytes());
-
-        assert!(verify_discord_request(
-            &signing_key.verifying_key(),
-            &signature_hex,
-            &timestamp,
-            body,
-        ));
-        assert!(!verify_discord_request(
-            &signing_key.verifying_key(),
-            &signature_hex,
-            &timestamp,
-            br#"{"type":2}"#,
-        ));
-    }
-
-    #[test]
-    fn manual_poll_has_a_per_user_cooldown() {
-        let cooldowns = Mutex::new(HashMap::new());
-        let user = Id::new(123_456_789);
-
-        assert_eq!(claim_manual_poll(&cooldowns, user), None);
-        assert!(claim_manual_poll(&cooldowns, user).is_some());
-        assert_eq!(claim_manual_poll(&cooldowns, Id::new(987_654_321)), None);
-    }
-
-    #[test]
-    fn registers_guild_or_global_league_command() {
-        let signing_key = SigningKey::from_bytes(&[7; 32]);
-        let mut config = InteractionConfig {
-            application_id: Id::new(123),
-            public_key: signing_key.verifying_key(),
-            guild_id: Some(Id::new(456)),
-        };
-        let (guild_url, guild_command) = command_registration(&config);
-        assert!(guild_url.ends_with("/applications/123/guilds/456/commands"));
-        assert_eq!(guild_command["name"], "league");
-        assert!(guild_command.get("contexts").is_none());
-
-        config.guild_id = None;
-        let (global_url, global_command) = command_registration(&config);
-        assert!(global_url.ends_with("/applications/123/commands"));
-        assert_eq!(global_command["contexts"], json!([0]));
-    }
-
-    #[test]
     fn parses_current_riot_api_shapes() {
         let entries: Vec<LeagueEntryDto> = serde_json::from_str(
             r#"[{
@@ -1748,14 +1031,6 @@ mod tests {
             "Master"
         );
         assert!(match_data.info.participants[0].win);
-    }
-
-    #[test]
-    fn checked_in_config_is_valid_ron() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_CONFIG_PATH);
-        let source = fs::read_to_string(path).unwrap();
-        let file: FileConfig = ron::from_str(&source).unwrap();
-        validate_file_config(file).unwrap();
     }
 
     #[tokio::test]

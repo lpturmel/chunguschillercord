@@ -5,6 +5,8 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod config;
+mod discord;
 mod error;
 mod league;
 mod valorant;
@@ -15,8 +17,11 @@ async fn main() -> Result<()> {
     dotenv::dotenv().ok();
     init_tracing();
 
-    valorant::start_from_env()?;
-    let interaction_routes = league::initialize_from_env().await?;
+    let config = config::load()?;
+    let league_service =
+        league::initialize_from_env(config.schedule.clone(), config.league_players).await?;
+    let valorant_service = valorant::initialize_from_env(config.schedule, config.valorant_player)?;
+    let interaction_routes = discord::initialize_from_env(league_service, valorant_service).await?;
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()

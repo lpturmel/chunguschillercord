@@ -1,153 +1,123 @@
-use crate::error::{Error, Result};
-use chrono::{DateTime, Days, LocalResult, TimeZone, Utc};
-use chrono_tz::Tz;
+use crate::{
+    config::{Schedule, ValorantPlayerConfig},
+    error::{Error, Result},
+};
+use chrono::Utc;
 use reqwest::{Client as HenrikClient, StatusCode, Url};
 use serde::Deserialize;
-use std::{fmt, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 use tokio::time::sleep;
 use tracing::{error, info};
 use twilight_http::Client as DiscordClient;
 use twilight_model::id::{Id, marker::ChannelMarker};
 
 const HENRIKDEV_MMR_URL: &str = "https://api.henrikdev.xyz/valorant/v3/mmr/";
-const DEFAULT_REGION: &str = "na";
-const DEFAULT_PLATFORM: &str = "pc";
-const DEFAULT_RIOT_NAME: &str = "xRayzor";
-const DEFAULT_RIOT_TAG: &str = "0031";
-const DEFAULT_TIME_ZONE: &str = "America/Toronto";
-const POST_HOURS: [u32; 2] = [9, 23];
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
-struct Config {
-    henrikdev_api_key: String,
+struct WorkerConfig {
     discord_bot_token: String,
     discord_channel_id: Id<ChannelMarker>,
-    region: String,
-    platform: String,
-    riot_name: String,
-    riot_tag: String,
-    time_zone: Tz,
+    schedule: Schedule,
     post_on_startup: bool,
 }
 
-impl Config {
-    fn from_env() -> Result<Option<Self>> {
-        let Some(henrikdev_api_key) = env_value("HENRIKDEV_API_KEY") else {
-            info!("Valorant rank bot is disabled; HENRIKDEV_API_KEY is not set");
-            return Ok(None);
-        };
+pub(crate) struct ValorantService {
+    client: HenrikClient,
+    api_key: String,
+    player: ValorantPlayerConfig,
+}
 
-        let discord_bot_token = require_value("DISCORD_BOT_TOKEN", env_value("DISCORD_BOT_TOKEN"))?;
-        let discord_channel_id =
-            require_value("DISCORD_CHANNEL_ID", env_value("DISCORD_CHANNEL_ID"))?;
-        let discord_channel_id = discord_channel_id.parse::<u64>().map_err(|_| {
-            Error::Config("DISCORD_CHANNEL_ID must be a positive integer".to_string())
-        })?;
-        let discord_channel_id = Id::new_checked(discord_channel_id).ok_or_else(|| {
-            Error::Config("DISCORD_CHANNEL_ID must be greater than zero".to_string())
-        })?;
+impl ValorantService {
+    pub(crate) async fn current_rank_message(&self) -> WorkerResult<String> {
+        let rank = fetch_rank(&self.client, &self.api_key, &self.player).await?;
+        Ok(format_rank_message(&self.player, &rank))
+    }
 
-        let region = optional_env("VALORANT_REGION", DEFAULT_REGION);
-        if !matches!(region.as_str(), "ap" | "br" | "eu" | "kr" | "latam" | "na") {
-            return Err(Error::Config(format!(
-                "VALORANT_REGION must be one of ap, br, eu, kr, latam, or na; got {region}"
-            )));
-        }
-
-        let platform = optional_env("VALORANT_PLATFORM", DEFAULT_PLATFORM);
-        if !matches!(platform.as_str(), "pc" | "console") {
-            return Err(Error::Config(format!(
-                "VALORANT_PLATFORM must be pc or console; got {platform}"
-            )));
-        }
-
-        let time_zone_name = optional_env("VALORANT_RANK_TIME_ZONE", DEFAULT_TIME_ZONE);
-        let time_zone = time_zone_name.parse::<Tz>().map_err(|_| {
-            Error::Config(format!(
-                "VALORANT_RANK_TIME_ZONE must be an IANA time zone; got {time_zone_name}"
-            ))
-        })?;
-
-        Ok(Some(Self {
-            henrikdev_api_key,
-            discord_bot_token,
-            discord_channel_id,
-            region,
-            platform,
-            riot_name: optional_env("VALORANT_RIOT_NAME", DEFAULT_RIOT_NAME),
-            riot_tag: optional_env("VALORANT_RIOT_TAG", DEFAULT_RIOT_TAG),
-            time_zone,
-            post_on_startup: env_flag("VALORANT_RANK_POST_ON_STARTUP"),
-        }))
+    pub(crate) fn riot_id(&self) -> &str {
+        &self.player.riot_id
     }
 }
 
-pub fn start_from_env() -> Result<()> {
-    let Some(config) = Config::from_env()? else {
-        info!("Valorant rank bot is disabled; Discord and HenrikDev credentials are not set");
-        return Ok(());
+pub(crate) fn initialize_from_env(
+    schedule: Schedule,
+    player: ValorantPlayerConfig,
+) -> Result<Option<Arc<ValorantService>>> {
+    let Some(api_key) = env_value("HENRIKDEV_API_KEY") else {
+        info!("Valorant rank bot is disabled; HENRIKDEV_API_KEY is not set");
+        return Ok(None);
     };
-
-    info!(
-        riot_id = %format!("{}#{}", config.riot_name, config.riot_tag),
-        region = %config.region,
-        platform = %config.platform,
-        time_zone = %config.time_zone,
-        "Starting Valorant rank bot; posts are scheduled for 09:00 and 23:00"
-    );
-
-    tokio::spawn(run(config));
-    Ok(())
-}
-
-async fn run(config: Config) {
-    let henrik_client = match HenrikClient::builder()
+    let discord_bot_token = require_value("DISCORD_BOT_TOKEN", env_value("DISCORD_BOT_TOKEN"))?;
+    let discord_channel_id = parse_channel_id(&require_value(
+        "DISCORD_CHANNEL_ID",
+        env_value("DISCORD_CHANNEL_ID"),
+    )?)?;
+    let client = HenrikClient::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent("chunguschillercord/0.1 Valorant rank bot")
         .build()
-    {
-        Ok(client) => client,
-        Err(err) => {
-            error!("Failed to initialize HenrikDev HTTP client: {err}");
-            return;
-        }
+        .map_err(|err| Error::Config(format!("Failed to initialize HenrikDev client: {err}")))?;
+    let service = Arc::new(ValorantService {
+        client,
+        api_key,
+        player,
+    });
+    let config = WorkerConfig {
+        discord_bot_token,
+        discord_channel_id,
+        schedule,
+        post_on_startup: env_flag("VALORANT_RANK_POST_ON_STARTUP"),
     };
+
+    info!(
+        riot_id = %service.player.riot_id,
+        region = %service.player.region,
+        platform = %service.player.platform,
+        time_zone = %config.schedule.time_zone,
+        post_times = %config.schedule.formatted_post_times(),
+        "Starting Valorant rank bot"
+    );
+
+    tokio::spawn(run(config, Arc::clone(&service)));
+    Ok(Some(service))
+}
+
+async fn run(config: WorkerConfig, service: Arc<ValorantService>) {
     let discord_client = DiscordClient::new(config.discord_bot_token.clone());
 
     if config.post_on_startup {
         info!("Posting immediate Valorant rank message for integration testing");
-        if let Err(err) = post_current_rank(&henrik_client, &discord_client, &config).await {
+        if let Err(err) = post_current_rank(&service, &discord_client, &config).await {
             error!("Failed to post startup Valorant rank: {err}");
         }
     }
 
     loop {
         let now = Utc::now();
-        let next_post = next_post_after(now, config.time_zone);
+        let next_post = config.schedule.next_post_after(now);
         let wait = (next_post - now)
             .to_std()
             .unwrap_or_else(|_| Duration::from_secs(0));
 
         info!(
-            next_post = %next_post.with_timezone(&config.time_zone),
+            next_post = %next_post.with_timezone(&config.schedule.time_zone),
             "Valorant rank post scheduled"
         );
         sleep(wait).await;
 
-        if let Err(err) = post_current_rank(&henrik_client, &discord_client, &config).await {
+        if let Err(err) = post_current_rank(&service, &discord_client, &config).await {
             error!("Failed to post Valorant rank: {err}");
         }
     }
 }
 
 async fn post_current_rank(
-    henrik_client: &HenrikClient,
+    service: &ValorantService,
     discord_client: &DiscordClient,
-    config: &Config,
+    config: &WorkerConfig,
 ) -> std::result::Result<(), WorkerError> {
-    let rank = fetch_rank(henrik_client, config).await?;
-    let message = format_rank_message(config, &rank);
+    let rank = fetch_rank(&service.client, &service.api_key, &service.player).await?;
+    let message = format_rank_message(&service.player, &rank);
 
     discord_client
         .create_message(config.discord_channel_id)
@@ -155,7 +125,7 @@ async fn post_current_rank(
         .await?;
 
     info!(
-        riot_id = %format!("{}#{}", config.riot_name, config.riot_tag),
+        riot_id = %service.player.riot_id,
         tier = %rank.tier.name,
         rr = rank.rr,
         "Posted Valorant rank to Discord"
@@ -165,22 +135,23 @@ async fn post_current_rank(
 
 async fn fetch_rank(
     client: &HenrikClient,
-    config: &Config,
+    api_key: &str,
+    player: &ValorantPlayerConfig,
 ) -> std::result::Result<CurrentRank, WorkerError> {
     let mut url = Url::parse(HENRIKDEV_MMR_URL).expect("HenrikDev MMR URL is valid");
     url.path_segments_mut()
         .expect("HenrikDev MMR URL supports path segments")
         .pop_if_empty()
         .extend([
-            config.region.as_str(),
-            config.platform.as_str(),
-            config.riot_name.as_str(),
-            config.riot_tag.as_str(),
+            player.region.as_str(),
+            player.platform.as_str(),
+            player.game_name.as_str(),
+            player.tag_line.as_str(),
         ]);
 
     let response = client
         .get(url)
-        .header("Authorization", &config.henrikdev_api_key)
+        .header("Authorization", api_key)
         .send()
         .await?;
     let status = response.status();
@@ -195,8 +166,7 @@ async fn fetch_rank(
     Ok(response.data.current)
 }
 
-fn format_rank_message(config: &Config, rank: &CurrentRank) -> String {
-    let riot_id = format!("{}#{}", config.riot_name, config.riot_tag);
+fn format_rank_message(player: &ValorantPlayerConfig, rank: &CurrentRank) -> String {
     let last_change = match rank.last_change {
         Some(change) if change > 0 => format!(" (+{change} RR last game)"),
         Some(change) if change < 0 => format!(" ({change} RR last game)"),
@@ -204,43 +174,9 @@ fn format_rank_message(config: &Config, rank: &CurrentRank) -> String {
     };
 
     format!(
-        "**{riot_id}** is currently **{} — {} RR**{last_change}.",
-        rank.tier.name, rank.rr
+        "**{}** is currently **{} — {} RR**{last_change}.",
+        player.riot_id, rank.tier.name, rank.rr
     )
-}
-
-fn next_post_after(now: DateTime<Utc>, time_zone: Tz) -> DateTime<Utc> {
-    let local_now = now.with_timezone(&time_zone);
-
-    for day_offset in 0..=1 {
-        let date = local_now
-            .date_naive()
-            .checked_add_days(Days::new(day_offset))
-            .expect("next rank post date is representable");
-
-        for hour in POST_HOURS {
-            let local_time = date
-                .and_hms_opt(hour, 0, 0)
-                .expect("rank post hour is valid");
-            let candidate = match time_zone.from_local_datetime(&local_time) {
-                LocalResult::Single(candidate) => candidate,
-                LocalResult::Ambiguous(earlier, later) => {
-                    if earlier > local_now {
-                        earlier
-                    } else {
-                        later
-                    }
-                }
-                LocalResult::None => continue,
-            };
-
-            if candidate > local_now {
-                return candidate.with_timezone(&Utc);
-            }
-        }
-    }
-
-    unreachable!("a scheduled Valorant rank post exists within the next day")
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -254,8 +190,12 @@ fn require_value(name: &str, value: Option<String>) -> Result<String> {
     value.ok_or_else(|| Error::Config(format!("Missing env var {name}")))
 }
 
-fn optional_env(name: &str, default: &str) -> String {
-    env_value(name).unwrap_or_else(|| default.to_string())
+fn parse_channel_id(value: &str) -> Result<Id<ChannelMarker>> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| Error::Config("DISCORD_CHANNEL_ID must be a positive integer".to_string()))?;
+    Id::new_checked(value)
+        .ok_or_else(|| Error::Config("DISCORD_CHANNEL_ID must be greater than zero".to_string()))
 }
 
 fn env_flag(name: &str) -> bool {
@@ -288,8 +228,10 @@ struct Tier {
     name: String,
 }
 
+type WorkerResult<T> = std::result::Result<T, WorkerError>;
+
 #[derive(Debug)]
-enum WorkerError {
+pub(crate) enum WorkerError {
     Request(reqwest::Error),
     HenrikDev { status: StatusCode, detail: String },
     Discord(twilight_http::Error),
@@ -323,48 +265,14 @@ impl From<twilight_http::Error> for WorkerError {
 mod tests {
     use super::*;
 
-    fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
-            .single()
-            .unwrap()
-    }
-
-    #[test]
-    fn schedules_nine_am_during_daylight_saving_time() {
-        let next = next_post_after(utc(2026, 8, 6, 12, 59), chrono_tz::America::Toronto);
-        assert_eq!(next, utc(2026, 8, 6, 13, 0));
-    }
-
-    #[test]
-    fn schedules_eleven_pm_after_the_morning_post() {
-        let next = next_post_after(utc(2026, 8, 6, 13, 1), chrono_tz::America::Toronto);
-        assert_eq!(next, utc(2026, 8, 7, 3, 0));
-    }
-
-    #[test]
-    fn schedules_nine_am_during_standard_time() {
-        let next = next_post_after(utc(2026, 12, 6, 13, 59), chrono_tz::America::Toronto);
-        assert_eq!(next, utc(2026, 12, 6, 14, 0));
-    }
-
-    #[test]
-    fn schedules_next_morning_after_the_evening_post() {
-        let next = next_post_after(utc(2026, 8, 7, 3, 1), chrono_tz::America::Toronto);
-        assert_eq!(next, utc(2026, 8, 7, 13, 0));
-    }
-
     #[test]
     fn formats_positive_and_negative_rank_changes() {
-        let config = Config {
-            henrikdev_api_key: "key".to_string(),
-            discord_bot_token: "token".to_string(),
-            discord_channel_id: Id::new(1),
+        let player = ValorantPlayerConfig {
+            riot_id: "xRayzor#0031".to_string(),
+            game_name: "xRayzor".to_string(),
+            tag_line: "0031".to_string(),
             region: "na".to_string(),
             platform: "pc".to_string(),
-            riot_name: "xRayzor".to_string(),
-            riot_tag: "0031".to_string(),
-            time_zone: chrono_tz::America::Toronto,
-            post_on_startup: false,
         };
         let positive = CurrentRank {
             tier: Tier {
@@ -382,11 +290,11 @@ mod tests {
         };
 
         assert_eq!(
-            format_rank_message(&config, &positive),
+            format_rank_message(&player, &positive),
             "**xRayzor#0031** is currently **Gold 2 — 63 RR** (+18 RR last game)."
         );
         assert_eq!(
-            format_rank_message(&config, &negative),
+            format_rank_message(&player, &negative),
             "**xRayzor#0031** is currently **Gold 2 — 44 RR** (-19 RR last game)."
         );
     }
