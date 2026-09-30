@@ -1,2 +1,15 @@
-target
-.git
+# Only application build inputs may leave this checkout. In particular, no .env,
+# credential files, local caches, addon exports, backups or unrelated user files.
+**
+!Cargo.toml
+!Cargo.lock
+!Dockerfile
+!.dockerignore
+!src/
+!src/**
+!migrations/
+!migrations/**
+!config/
+!config/*.example.*
+!config/league-valorant-rank.ron
+!config/wow-keystones.json

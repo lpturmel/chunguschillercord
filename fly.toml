@@ -6,6 +6,8 @@ primary_region = "yyz"
 [env]
   PORT = "8080"
   CHUNGUSCHILLERCORD_DATABASE_PATH = "/data/chunguschillercord.db"
+  DISCORD_REGISTER_COMMANDS_ON_STARTUP = "false"
+  VALORANT_RANK_POST_ON_STARTUP = "0"
 
 [http_service]
   internal_port = 8080

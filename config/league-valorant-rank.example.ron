@@ -1,0 +1,17 @@
+// Example only: replace these fictional players in your private runtime file.
+(
+    timezone: "America/Toronto",
+    post_times: ["23:00"],
+    league: (users: [(
+        riot_id: "ExamplePlayer#EXAMPLE",
+        platform: "na1",
+        regional_route: "americas",
+        discord_user_id: None,
+    )]),
+    valorant: (
+        riot_id: "ExamplePlayer#EXAMPLE",
+        region: "na",
+        platform: "pc",
+        discord_user_id: None,
+    ),
+)

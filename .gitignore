@@ -1,3 +1,16 @@
 target
 config/*
-!config/league-valorant-rank.ron
+!config/*.example.*
+.wow-addon-backups/
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+scripts/__pycache__/
+# Keep owner-specific live evidence private.
+docs/wow-keystones-qa.md
+docs/wow-keystones-readback.txt
+docs/wow-keys-discord-qa.md
+docs/wow-keys-deployment.md
+docs/wow-live-bridge-investigation.md

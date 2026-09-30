@@ -6,8 +6,10 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod database;
 mod discord;
 mod error;
+mod keystones;
 mod league;
 mod valorant;
 
@@ -17,11 +19,33 @@ async fn main() -> Result<()> {
     dotenv::dotenv().ok();
     init_tracing();
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--keystones") {
+        return keystones::run(&args[1..]).await;
+    }
+
+    if args.first().map(String::as_str) == Some("--discord-registration-info") {
+        if args.len() != 1 {
+            return Err(Error::Config(
+                "--discord-registration-info takes no arguments".into(),
+            ));
+        }
+        return discord::registration_info().await;
+    }
+
     let config = config::load()?;
-    let league_service =
-        league::initialize_from_env(config.schedule.clone(), config.league_players).await?;
-    let valorant_service = valorant::initialize_from_env(config.schedule, config.valorant_player)?;
-    let interaction_routes = discord::initialize_from_env(league_service, valorant_service).await?;
+    let database = database::BotDatabase::initialize_from_env().await?;
+    let league_service = league::initialize_from_env(
+        config.schedule.clone(),
+        config.league_players,
+        database.clone(),
+    )
+    .await?;
+    let valorant_service =
+        valorant::initialize_from_env(config.schedule, config.valorant_player, database.clone())?;
+    let keystone_service = keystones::KeystoneService::initialize(database)?;
+    let interaction_routes =
+        discord::initialize_from_env(league_service, valorant_service, keystone_service).await?;
     let port = std::env::var("PORT")
         .unwrap_or_else(|_| "8080".to_string())
         .parse::<u16>()

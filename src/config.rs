@@ -390,7 +390,8 @@ mod tests {
 
     #[test]
     fn checked_in_config_is_valid_ron() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_CONFIG_PATH);
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("config/league-valorant-rank.example.ron");
         let source = fs::read_to_string(path).unwrap();
         validate(ron::from_str(&source).unwrap()).unwrap();
     }

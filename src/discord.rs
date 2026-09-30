@@ -1,5 +1,6 @@
 use crate::{
     error::{Error, Result},
+    keystones::KeystoneService,
     league::LeagueService,
     valorant::ValorantService,
 };
@@ -44,6 +45,7 @@ const DEFERRED_MESSAGE_RESPONSE: u8 = 5;
 enum Command {
     League,
     Valorant,
+    Keys,
 }
 
 impl Command {
@@ -51,6 +53,7 @@ impl Command {
         match name {
             "league" => Some(Self::League),
             "valorant" => Some(Self::Valorant),
+            "keys" => Some(Self::Keys),
             _ => None,
         }
     }
@@ -59,6 +62,7 @@ impl Command {
         match self {
             Self::League => "league",
             Self::Valorant => "valorant",
+            Self::Keys => "keys",
         }
     }
 
@@ -66,6 +70,7 @@ impl Command {
         match self {
             Self::League => "Show your League ranked recap",
             Self::Valorant => "Show the configured Valorant rank",
+            Self::Keys => "List available allowlisted WoW keystone snapshots and their freshness",
         }
     }
 }
@@ -105,6 +110,8 @@ impl InteractionConfig {
 struct InteractionState {
     league: Option<Arc<LeagueService>>,
     valorant: Option<Arc<ValorantService>>,
+    keys: Option<Arc<KeystoneService>>,
+    guild_id: Option<Id<GuildMarker>>,
     discord_client: Arc<DiscordClient>,
     application_id: Id<ApplicationMarker>,
     public_key: VerifyingKey,
@@ -114,29 +121,47 @@ struct InteractionState {
 pub(crate) async fn initialize_from_env(
     league: Option<Arc<LeagueService>>,
     valorant: Option<Arc<ValorantService>>,
+    mut keys: Option<Arc<KeystoneService>>,
 ) -> Result<Router> {
-    if league.is_none() && valorant.is_none() {
+    if league.is_none() && valorant.is_none() && keys.is_none() {
         return Ok(Router::new());
     }
     let Some(config) = InteractionConfig::from_env()? else {
         info!(
-            "Discord rank commands are disabled; DISCORD_APPLICATION_ID and DISCORD_PUBLIC_KEY are not set"
+            "Discord commands are disabled; DISCORD_APPLICATION_ID and DISCORD_PUBLIC_KEY are not set"
         );
         return Ok(Router::new());
     };
+    // Keystone records are shared only inside the explicitly configured guild.
+    if keys.is_some() && config.guild_id.is_none() {
+        warn!("/keys is disabled until DISCORD_GUILD_ID is configured");
+        keys = None;
+    }
+    if league.is_none() && valorant.is_none() && keys.is_none() {
+        return Ok(Router::new());
+    }
     let bot_token = require_env("DISCORD_BOT_TOKEN")?;
     let commands = [
         league.as_ref().map(|_| Command::League),
         valorant.as_ref().map(|_| Command::Valorant),
+        keys.as_ref().map(|_| Command::Keys),
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    register_commands(&bot_token, &config, &commands).await?;
+    if register_on_startup(env_value("DISCORD_REGISTER_COMMANDS_ON_STARTUP").as_deref())? {
+        register_commands(&bot_token, &config, &commands).await?;
+    } else {
+        info!(
+            "Automatic Discord command registration is disabled; existing registrations are retained"
+        );
+    }
 
     let state = Arc::new(InteractionState {
         league,
         valorant,
+        keys,
+        guild_id: config.guild_id,
         discord_client: Arc::new(DiscordClient::new(bot_token)),
         application_id: config.application_id,
         public_key: config.public_key,
@@ -154,6 +179,8 @@ struct DiscordInteraction {
     kind: u8,
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    guild_id: Option<String>,
     #[serde(default)]
     data: Option<DiscordInteractionData>,
     #[serde(default)]
@@ -218,7 +245,10 @@ async fn handle_interaction(
         .as_ref()
         .and_then(|data| Command::from_name(&data.name));
     if interaction.kind != APPLICATION_COMMAND || command.is_none() {
-        return discord_message("This endpoint handles `/league` and `/valorant`.", true);
+        return discord_message(
+            "This endpoint handles `/league`, `/valorant` and `/keys`.",
+            true,
+        );
     }
     let command = command.expect("checked above");
     let Some(discord_user_id) = interaction.author_id() else {
@@ -228,7 +258,64 @@ async fn handle_interaction(
     match command {
         Command::League => handle_league(state, interaction, discord_user_id),
         Command::Valorant => handle_valorant(state, interaction, discord_user_id),
+        Command::Keys => handle_keys(state, interaction, discord_user_id),
     }
+}
+
+fn keys_guild_allowed(
+    interaction: &DiscordInteraction,
+    configured: Option<Id<GuildMarker>>,
+) -> bool {
+    configured.is_some_and(|guild| {
+        interaction.member.is_some()
+            && interaction
+                .guild_id
+                .as_deref()
+                .and_then(|v| v.parse::<u64>().ok())
+                == Some(guild.get())
+    })
+}
+fn handle_keys(
+    state: Arc<InteractionState>,
+    interaction: DiscordInteraction,
+    discord_user_id: Id<UserMarker>,
+) -> Response {
+    if !keys_guild_allowed(&interaction, state.guild_id) {
+        return discord_message("Use /keys in the configured server.", true);
+    }
+    let Some(service) = state.keys.as_ref() else {
+        return discord_message("The keystone command is currently disabled.", true);
+    };
+    let Some(token) = interaction.token else {
+        return discord_message("Discord did not include an interaction token.", true);
+    };
+    if let Some(remaining) = claim_manual_poll(&state.cooldowns, Command::Keys, discord_user_id) {
+        return cooldown_message(Command::Keys, remaining);
+    }
+    let service = Arc::clone(service);
+    let discord_client = Arc::clone(&state.discord_client);
+    let application_id = state.application_id;
+    tokio::spawn(async move {
+        let content = match tokio::time::timeout(REQUEST_TIMEOUT, service.prepare_report()).await {
+            Ok(Ok(content)) => content,
+            // No local-cache fallback after a failed pull: it could misreport available keys.
+            Ok(Err(_)) | Err(_) => {
+                error!("/keys could not load validated snapshots from Turso");
+                "I couldn't load the keystone snapshots right now. Please try again shortly."
+                    .to_string()
+            }
+        };
+        if let Err(err) = discord_client
+            .interaction(application_id)
+            .update_response(&token)
+            .content(Some(&content))
+            .allowed_mentions(Some(&AllowedMentions::default()))
+            .await
+        {
+            error!("Failed to finish /keys response: {err}");
+        }
+    });
+    discord_response(DEFERRED_MESSAGE_RESPONSE, None)
 }
 
 fn handle_league(
@@ -415,6 +502,55 @@ fn discord_response(kind: u8, data: Option<serde_json::Value>) -> Response {
     axum::Json(payload).into_response()
 }
 
+/// Read only the guild of the already configured bot channel; never print credentials.
+pub(crate) async fn registration_info() -> Result<()> {
+    let application_id = parse_application_id(&require_env("DISCORD_APPLICATION_ID")?)?;
+    let channel_id = parse_id::<twilight_model::id::marker::ChannelMarker>(
+        &require_env("DISCORD_CHANNEL_ID")?,
+        "DISCORD_CHANNEL_ID",
+    )?;
+    let response = HttpClient::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()?
+        .get(format!(
+            "https://discord.com/api/v10/channels/{}",
+            channel_id.get()
+        ))
+        .header(
+            "Authorization",
+            format!("Bot {}", require_env("DISCORD_BOT_TOKEN")?),
+        )
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(Error::Config(format!(
+            "Could not read configured Discord channel ({})",
+            response.status()
+        )));
+    }
+    let channel: serde_json::Value = response.json().await?;
+    let guild_id = channel
+        .get("guild_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Config("Configured Discord channel has no server ID".into()))?;
+    let guild_id = parse_guild_id(guild_id)?;
+    println!(
+        "{}",
+        json!({"applicationId": application_id.get().to_string(), "guildId": guild_id.get().to_string()})
+    );
+    Ok(())
+}
+
+fn register_on_startup(value: Option<&str>) -> Result<bool> {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("1" | "true" | "yes" | "on") => Ok(true),
+        Some("0" | "false" | "no" | "off") => Ok(false),
+        _ => Err(Error::Config(
+            "DISCORD_REGISTER_COMMANDS_ON_STARTUP must be true or false".into(),
+        )),
+    }
+}
+
 async fn register_commands(
     bot_token: &str,
     config: &InteractionConfig,
@@ -557,6 +693,8 @@ mod tests {
         assert_eq!(claim_manual_poll(&cooldowns, Command::League, user), None);
         assert!(claim_manual_poll(&cooldowns, Command::League, user).is_some());
         assert_eq!(claim_manual_poll(&cooldowns, Command::Valorant, user), None);
+        assert_eq!(claim_manual_poll(&cooldowns, Command::Keys, user), None);
+        assert!(claim_manual_poll(&cooldowns, Command::Keys, user).is_some());
         assert_eq!(
             claim_manual_poll(&cooldowns, Command::League, Id::new(987_654_321)),
             None
@@ -564,14 +702,14 @@ mod tests {
     }
 
     #[test]
-    fn registers_both_commands_in_guild_or_global_scope() {
+    fn registers_commands_in_existing_guild_or_global_scope() {
         let signing_key = SigningKey::from_bytes(&[7; 32]);
         let mut config = InteractionConfig {
             application_id: Id::new(123),
             public_key: signing_key.verifying_key(),
             guild_id: Some(Id::new(456)),
         };
-        for command in [Command::League, Command::Valorant] {
+        for command in [Command::League, Command::Valorant, Command::Keys] {
             let (url, payload) = command_registration(&config, command);
             assert!(url.ends_with("/applications/123/guilds/456/commands"));
             assert_eq!(payload["name"], command.name());
@@ -582,5 +720,80 @@ mod tests {
         let (url, payload) = command_registration(&config, Command::Valorant);
         assert!(url.ends_with("/applications/123/commands"));
         assert_eq!(payload["contexts"], json!([0]));
+    }
+    #[test]
+    fn keys_access_requires_member_of_configured_guild() {
+        assert_eq!(Command::from_name("keys"), Some(Command::Keys));
+        let mut interaction: DiscordInteraction = serde_json::from_value(json!({
+            "type": 2, "data": {"name":"keys"}, "guild_id":"456",
+            "member":{"user":{"id":"789"}}
+        }))
+        .unwrap();
+        assert!(keys_guild_allowed(&interaction, Some(Id::new(456))));
+        assert!(!keys_guild_allowed(&interaction, Some(Id::new(123))));
+        assert!(!keys_guild_allowed(&interaction, None));
+        interaction.guild_id = None;
+        assert!(!keys_guild_allowed(&interaction, Some(Id::new(456))));
+        interaction.guild_id = Some("456".into());
+        interaction.member = None;
+        assert!(!keys_guild_allowed(&interaction, Some(Id::new(456))));
+    }
+
+    #[tokio::test]
+    async fn signed_keys_request_in_wrong_guild_is_ephemeral_without_discord_call() {
+        crate::install_rustls_crypto_provider();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let state = Arc::new(InteractionState {
+            league: None,
+            valorant: None,
+            keys: None,
+            guild_id: Some(Id::new(456)),
+            discord_client: Arc::new(DiscordClient::new("local-fixture-unused".into())),
+            application_id: Id::new(123),
+            public_key: signing_key.verifying_key(),
+            cooldowns: Mutex::new(HashMap::new()),
+        });
+        let body = Bytes::from_static(
+            br#"{"type":2,"data":{"name":"keys"},"guild_id":"999","member":{"user":{"id":"789"}}}"#,
+        );
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        let mut signed = timestamp.as_bytes().to_vec();
+        signed.extend_from_slice(&body);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Signature-Timestamp", timestamp.parse().unwrap());
+        headers.insert(
+            "X-Signature-Ed25519",
+            hex::encode(signing_key.sign(&signed).to_bytes())
+                .parse()
+                .unwrap(),
+        );
+        let response = handle_interaction(State(state), headers, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["type"], MESSAGE_RESPONSE);
+        assert_eq!(payload["data"]["flags"], EPHEMERAL_FLAG);
+        assert_eq!(payload["data"]["allowed_mentions"]["parse"], json!([]));
+        assert!(
+            payload["data"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("configured server")
+        );
+    }
+    #[test]
+    fn automatic_registration_can_be_explicitly_disabled() {
+        assert!(register_on_startup(None).unwrap());
+        for value in ["0", "false", "FALSE", "off", "no"] {
+            assert!(!register_on_startup(Some(value)).unwrap());
+        }
+        assert!(register_on_startup(Some("true")).unwrap());
+        assert!(register_on_startup(Some("typo")).is_err());
     }
 }

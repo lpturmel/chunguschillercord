@@ -1,0 +1,9 @@
+## Interface: 120100, 120105, 120007
+## Title: Chungus Keystone Recorder
+## Notes: Saves only explicitly allowed character/realm keystones for the owner's companion.
+## Author: Chungus Chiller Cord
+## Version: 0.1.0
+## OptionalDeps: BigWigs, LibKeystone
+## SavedVariables: CCCKeystonesDB
+Allowlist.lua
+Recorder.lua

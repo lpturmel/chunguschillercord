@@ -1,13 +1,14 @@
 use crate::{
     config::{LeaguePlayerConfig as PlayerConfig, Schedule},
+    database::BotDatabase,
     error::{Error, Result},
 };
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use reqwest::{Client as HttpClient, StatusCode, Url, header::RETRY_AFTER};
 use serde::{Deserialize, de::DeserializeOwned};
-use std::{fmt, fs, sync::Arc, time::Duration};
-use tokio::{sync::Mutex as AsyncMutex, time::sleep};
+use std::{fmt, sync::Arc, time::Duration};
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 use twilight_http::Client as DiscordClient;
 use twilight_model::{
@@ -18,19 +19,6 @@ use twilight_model::{
     },
 };
 
-const DEFAULT_DATABASE_PATH: &str = "/tmp/chunguschillercord.db";
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "create_schema_migrations",
-        sql: include_str!("../migrations/0001_create_schema_migrations.sql"),
-    },
-    Migration {
-        version: 2,
-        name: "create_league_rank_snapshots",
-        sql: include_str!("../migrations/0002_create_league_rank_snapshots.sql"),
-    },
-];
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const MATCH_REQUEST_PAUSE: Duration = Duration::from_millis(75);
 const RANKED_SOLO_QUEUE_ID: u16 = 420;
@@ -68,11 +56,15 @@ impl Config {
 pub(crate) async fn initialize_from_env(
     schedule: Schedule,
     users: Vec<PlayerConfig>,
+    database: Option<BotDatabase>,
 ) -> Result<Option<Arc<LeagueService>>> {
     let Some(config) = Config::from_env(schedule, users)? else {
         return Ok(None);
     };
-    let store = RankStore::from_env().await?;
+    let database = database.ok_or_else(|| {
+        Error::Config("Rank database was not initialized for the League worker".to_string())
+    })?;
+    let store = RankStore { database };
     let riot_client = RiotClient::new(config.riot_api_key.clone())
         .map_err(|err| Error::Config(format!("Failed to initialize Riot API client: {err}")))?;
     let service = Arc::new(LeagueService {
@@ -360,134 +352,17 @@ impl RiotClient {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Migration {
-    version: i64,
-    name: &'static str,
-    sql: &'static str,
-}
-
-#[derive(Clone)]
-enum BotDatabase {
-    #[cfg(test)]
-    Local(turso::Database),
-    Synced(turso::sync::Database),
-}
-
-impl BotDatabase {
-    async fn connect(&self) -> turso::Result<turso::Connection> {
-        match self {
-            #[cfg(test)]
-            Self::Local(database) => database.connect(),
-            Self::Synced(database) => database.connect().await,
-        }
-    }
-
-    async fn pull(&self) -> turso::Result<()> {
-        match self {
-            Self::Synced(database) => {
-                database.pull().await?;
-            }
-            #[cfg(test)]
-            Self::Local(_) => {}
-        }
-        Ok(())
-    }
-
-    async fn push(&self) -> turso::Result<()> {
-        match self {
-            Self::Synced(database) => {
-                database.push().await?;
-            }
-            #[cfg(test)]
-            Self::Local(_) => {}
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone)]
 struct RankStore {
-    db: BotDatabase,
-    sync_lock: Arc<AsyncMutex<()>>,
+    database: BotDatabase,
 }
 
 impl RankStore {
-    async fn from_env() -> Result<Self> {
-        let database_url = require_env("TURSO_DATABASE_URL")?;
-        let auth_token = require_env("TURSO_AUTH_TOKEN")?;
-        let database_path = env_value("CHUNGUSCHILLERCORD_DATABASE_PATH")
-            .unwrap_or_else(|| DEFAULT_DATABASE_PATH.to_string());
-        if let Some(parent) = std::path::Path::new(&database_path).parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-
-        info!(%database_path, "Opening Turso synced database");
-        let database = turso::sync::Builder::new_remote(&database_path)
-            .with_remote_url(database_url)
-            .with_auth_token(auth_token)
-            .with_client_name("chunguschillercord")
-            .build()
-            .await?;
-        let store = Self::new(BotDatabase::Synced(database)).await?;
-        info!(%database_path, "Turso database is ready");
-        Ok(store)
-    }
-
     #[cfg(test)]
     async fn new_local(path: &std::path::Path) -> Result<Self> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| Error::Config("Test database path is not valid UTF-8".to_string()))?;
-        let database = turso::Builder::new_local(path).build().await?;
-        Self::new(BotDatabase::Local(database)).await
-    }
-
-    async fn new(db: BotDatabase) -> Result<Self> {
-        let store = Self {
-            db,
-            sync_lock: Arc::new(AsyncMutex::new(())),
-        };
-        store.run_migrations().await?;
-        Ok(store)
-    }
-
-    async fn run_migrations(&self) -> Result<()> {
-        let _guard = self.sync_lock.lock().await;
-        self.db.pull().await?;
-        let connection = self.db.connect().await?;
-
-        connection.execute_batch(MIGRATIONS[0].sql).await?;
-        for migration in MIGRATIONS {
-            let mut rows = connection
-                .query(
-                    "SELECT 1 FROM chunguschillercord_schema_migrations WHERE version = ? LIMIT 1",
-                    (migration.version,),
-                )
-                .await?;
-            if rows.next().await?.is_some() {
-                continue;
-            }
-            if migration.version != MIGRATIONS[0].version {
-                connection.execute_batch(migration.sql).await?;
-            }
-            connection
-                .execute(
-                    "INSERT INTO chunguschillercord_schema_migrations
-                     (version, name, applied_at) VALUES (?, ?, ?)",
-                    (migration.version, migration.name, Utc::now().to_rfc3339()),
-                )
-                .await?;
-            info!(
-                version = migration.version,
-                name = migration.name,
-                "Applied bot database migration"
-            );
-        }
-        self.db.push().await?;
-        Ok(())
+        Ok(Self {
+            database: BotDatabase::new_local(path).await?,
+        })
     }
 
     async fn latest_snapshot(
@@ -495,9 +370,9 @@ impl RankStore {
         player: &PlayerConfig,
         puuid: &str,
     ) -> WorkerResult<Option<RankSnapshot>> {
-        let _guard = self.sync_lock.lock().await;
-        self.db.pull().await?;
-        let connection = self.db.connect().await?;
+        let _guard = self.database.lock().await;
+        self.database.pull().await?;
+        let connection = self.database.connect().await?;
         let mut rows = connection
             .query(
                 "SELECT riot_id, puuid, platform_route, captured_at, tier, division, league_points
@@ -528,8 +403,8 @@ impl RankStore {
     }
 
     async fn save_snapshot(&self, snapshot: &RankSnapshot) -> WorkerResult<()> {
-        let _guard = self.sync_lock.lock().await;
-        let connection = self.db.connect().await?;
+        let _guard = self.database.lock().await;
+        let connection = self.database.connect().await?;
         connection
             .execute(
                 "INSERT INTO league_rank_snapshots
@@ -546,7 +421,7 @@ impl RankStore {
                 ],
             )
             .await?;
-        self.db.push().await?;
+        self.database.push().await?;
         Ok(())
     }
 }

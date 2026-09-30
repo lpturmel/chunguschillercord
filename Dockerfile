@@ -1,4 +1,4 @@
-FROM rust:1.95.0-slim-bullseye AS builder
+FROM rust:1.95.0-slim-bookworm AS builder
 
 WORKDIR /app
 RUN apt-get update && \
@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/app/target \
     cargo build --locked --release -p chunguschillercord && \
     cp target/release/chunguschillercord /chunguschillercord
 
-FROM debian:12.1-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update && \
     apt-get install --yes --no-install-recommends ca-certificates && \
